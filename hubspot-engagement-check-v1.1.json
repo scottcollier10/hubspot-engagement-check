@@ -1,0 +1,252 @@
+{
+  "name": "HubSpot Engagement Intelligence — /engagement-check v1.1",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "### 📊 ENGAGEMENT INTELLIGENCE — /engagement-check v1.1\n\n**Changes from v1.0:**\nReads from canonical fields (canon_engagement_score,\ncanon_engagement_status) which are writable.\nHubSpot native email fields are read-only and\ncannot be seeded for demo purposes.\n\n**Workflow for demo:**\n1. Run DEMO SEED v1.1 workflow first\n2. Type /engagement-check in Slack\n3. Report lands in #marketing\n\n**Post-import wiring check:**\nNo SplitInBatches here — linear flow only.\n\n**Credentials needed:**\n• HubSpot Data Normalization Engine Auth\n• Slack Key (httpHeaderAuth, same as Campaign Auditor)\n• Slack account (OAuth, same as Campaign Auditor)",
+        "height": 340,
+        "width": 460,
+        "color": 4
+      },
+      "id": "eng-note",
+      "name": "Workflow Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -220]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "engagement-check",
+        "responseMode": "responseNode",
+        "options": { "rawBody": false }
+      },
+      "id": "eng-webhook",
+      "name": "Webhook: Receive Command",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 300],
+      "webhookId": "engagement-check-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ response_type: 'in_channel', text: '📊 Running engagement health check... I\\'ll post the full report in #marketing when it\\'s ready.' }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "eng-ack",
+      "name": "Ack: Running Check",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [40, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"filterGroups\": [\n    {\n      \"filters\": [\n        {\n          \"propertyName\": \"canon_engagement_status\",\n          \"operator\": \"HAS_PROPERTY\"\n        }\n      ]\n    }\n  ],\n  \"properties\": [\n    \"firstname\",\n    \"lastname\",\n    \"email\",\n    \"jobtitle\",\n    \"company\",\n    \"lifecyclestage\",\n    \"canon_engagement_score\",\n    \"canon_engagement_status\",\n    \"canon_days_since_engagement\",\n    \"canon_engagement_last_calculated\",\n    \"canon_seniority\",\n    \"canon_persona\",\n    \"canon_data_confidence\"\n  ],\n  \"sorts\": [\n    {\n      \"propertyName\": \"canon_engagement_score\",\n      \"direction\": \"ASCENDING\"\n    }\n  ],\n  \"limit\": 100\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "eng-search",
+      "name": "Search: Contact Engagement Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [280, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// READ ENGAGEMENT SCORES FROM CANONICAL FIELDS\n// ============================================================\n// Reads canon_engagement_score and canon_engagement_status\n// which are written by:\n//   - DEMO SEED v1.1 (for demos)\n//   - Nightly Scorer workflow (for production)\n//\n// This approach avoids HubSpot's read-only native fields\n// while giving us full control over the data story.\n// ============================================================\n\nconst response = $input.first().json;\nconst contacts = response.results || [];\n\nfunction scoreColor(score) {\n  if (score >= 70) return 'good';\n  if (score >= 50) return 'warning';\n  return 'danger';\n}\n\n// ---- Parse and structure each contact ----\nconst scoredContacts = contacts.map(contact => {\n  const p = contact.properties || {};\n\n  const engagementScore  = parseInt(p.canon_engagement_score  || '0', 10);\n  const engagementStatus = p.canon_engagement_status || 'Unknown';\n  const daysSince        = parseInt(p.canon_days_since_engagement || '0', 10);\n  const lastCalculated   = p.canon_engagement_last_calculated || null;\n\n  return {\n    id:               contact.id,\n    name:             [p.firstname, p.lastname].filter(Boolean).join(' ') || '(No name)',\n    email:            p.email || '—',\n    jobTitle:         p.jobtitle || '—',\n    company:          p.company || '—',\n    lifecycleStage:   p.lifecyclestage || '—',\n    seniority:        p.canon_seniority || '—',\n    persona:          p.canon_persona || '—',\n    dataConfidence:   parseInt(p.canon_data_confidence || '0', 10),\n\n    // Canonical engagement fields\n    engagementScore,\n    engagementStatus,\n    daysSinceEngagement: daysSince,\n    lastCalculated,\n\n    hubspotUrl: `https://app-na2.hubspot.com/contacts/243444428/record/0-1/${contact.id}`\n  };\n});\n\n// ---- Aggregate status counts ----\nconst statusCounts = { 'Active': 0, 'At Risk': 0, 'Cold': 0, 'Dormant': 0, 'Opted Out': 0, 'Unknown': 0 };\nscoredContacts.forEach(c => {\n  if (statusCounts[c.engagementStatus] !== undefined) {\n    statusCounts[c.engagementStatus]++;\n  } else {\n    statusCounts['Unknown']++;\n  }\n});\n\n// Remove Unknown from counts if empty\nif (statusCounts['Unknown'] === 0) delete statusCounts['Unknown'];\n\nconst flaggedContacts = scoredContacts.filter(\n  c => !['Active'].includes(c.engagementStatus)\n);\n\nconst avgScore = scoredContacts.length > 0\n  ? Math.round(scoredContacts.reduce((sum, c) => sum + c.engagementScore, 0) / scoredContacts.length)\n  : 0;\n\nconsole.log(`[ENGAGEMENT CHECK] ${scoredContacts.length} contacts | avg score: ${avgScore} | flagged: ${flaggedContacts.length}`);\n\nreturn [{\n  json: {\n    allContacts:     scoredContacts,\n    flaggedContacts: flaggedContacts,\n    statusCounts,\n    totalContacts:   scoredContacts.length,\n    totalFlagged:    flaggedContacts.length,\n    avgScore,\n    calculatedAt:    new Date().toISOString()\n  }\n}];"
+      },
+      "id": "eng-read-scores",
+      "name": "Read Engagement Scores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// BUILD ENGAGEMENT HEALTH REPORT\n// ============================================================\n\nconst data = $input.first().json;\nconst {\n  allContacts, flaggedContacts, statusCounts,\n  totalContacts, totalFlagged, avgScore, calculatedAt\n} = data;\n\nconst reportDate = new Date().toLocaleDateString('en-US', {\n  year: 'numeric', month: 'long', day: 'numeric'\n});\nconst reportTime = new Date().toLocaleTimeString('en-US', {\n  hour: '2-digit', minute: '2-digit'\n});\n\nfunction escHtml(str) {\n  if (!str && str !== 0) return '';\n  return String(str)\n    .replace(/&/g, '&amp;').replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n}\n\nfunction statusColor(status) {\n  const map = {\n    'Active':    '#00A854', 'At Risk':   '#F5A623',\n    'Cold':      '#ea580c', 'Dormant':   '#E74C3C',\n    'Opted Out': '#6c757d', 'Unknown':   '#9ca3af'\n  };\n  return map[status] || '#495057';\n}\n\nfunction statusBg(status) {\n  const map = {\n    'Active':    '#dcfce7', 'At Risk':   '#fef3c7',\n    'Cold':      '#ffedd5', 'Dormant':   '#fee2e2',\n    'Opted Out': '#f3f4f6', 'Unknown':   '#f9fafb'\n  };\n  return map[status] || '#f3f4f6';\n}\n\nfunction scoreColor(score) {\n  if (score >= 70) return '#00A854';\n  if (score >= 50) return '#F5A623';\n  if (score >= 30) return '#ea580c';\n  return '#E74C3C';\n}\n\nfunction scoreBg(score) {\n  if (score >= 70) return '#dcfce7';\n  if (score >= 50) return '#fef3c7';\n  if (score >= 30) return '#ffedd5';\n  return '#fee2e2';\n}\n\nfunction formatDays(days) {\n  if (!days && days !== 0) return '—';\n  if (days === 0) return 'Today';\n  if (days === 1) return '1 day ago';\n  if (days < 30)  return `${days}d ago`;\n  if (days < 365) return `${Math.floor(days / 30)}mo ago`;\n  return `${Math.floor(days / 365)}yr ago`;\n}\n\nfunction overallGrade(avgScore, pctFlagged) {\n  if (avgScore >= 80 && pctFlagged < 10) return { grade: 'A', label: 'Healthy' };\n  if (avgScore >= 65 && pctFlagged < 25) return { grade: 'B', label: 'Good' };\n  if (avgScore >= 50 && pctFlagged < 40) return { grade: 'C', label: 'Needs Attention' };\n  if (avgScore >= 35)                    return { grade: 'D', label: 'At Risk' };\n  return                                        { grade: 'F', label: 'Critical' };\n}\n\nconst pctFlagged = totalContacts > 0\n  ? Math.round((totalFlagged / totalContacts) * 100)\n  : 0;\n\nconst health = overallGrade(avgScore, pctFlagged);\nconst gradeColors = { A: '#00A854', B: '#2C7BE5', C: '#F5A623', D: '#ea580c', F: '#E74C3C' };\nconst gradeColor = gradeColors[health.grade] || '#495057';\n\n// ---- Build table rows for flagged contacts ----\nconst tableRows = flaggedContacts.map(c => `\n  <tr>\n    <td>\n      <a href=\"${c.hubspotUrl}\" target=\"_blank\"\n         style=\"color:#1A3A5C;text-decoration:none;font-weight:600\">\n        ${escHtml(c.name)}\n      </a>\n      <div style=\"font-size:11px;color:#6c757d;margin-top:2px\">${escHtml(c.email)}</div>\n      ${c.company !== '—' ? `<div style=\"font-size:11px;color:#9ca3af\">${escHtml(c.company)}</div>` : ''}\n    </td>\n    <td>\n      <span style=\"display:inline-block;padding:3px 10px;border-radius:12px;\n        font-size:12px;font-weight:600;\n        background:${statusBg(c.engagementStatus)};\n        color:${statusColor(c.engagementStatus)}\">\n        ${escHtml(c.engagementStatus)}\n      </span>\n    </td>\n    <td style=\"text-align:center\">\n      <span style=\"display:inline-flex;align-items:center;justify-content:center;\n        width:36px;height:36px;border-radius:50%;font-weight:700;font-size:13px;\n        background:${scoreBg(c.engagementScore)};color:${scoreColor(c.engagementScore)}\">\n        ${c.engagementScore}\n      </span>\n    </td>\n    <td style=\"font-size:12px;color:#6c757d;text-align:center\">\n      ${escHtml(formatDays(c.daysSinceEngagement))}\n    </td>\n    <td style=\"font-size:12px;color:#9ca3af\">\n      ${escHtml(c.seniority !== '—' ? c.seniority : '')}\n    </td>\n    <td style=\"font-size:12px;color:#9ca3af\">\n      ${c.dataConfidence > 0\n        ? `<span style=\"color:${scoreColor(c.dataConfidence)}\">${c.dataConfidence}</span>`\n        : '—'\n      }\n    </td>\n  </tr>\n`).join('');\n\n// ---- Build full HTML report ----\nconst html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>Engagement Health Report — ${reportDate}</title>\n<style>\n  * { margin: 0; padding: 0; box-sizing: border-box; }\n  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #495057; background: #fff; line-height: 1.6; }\n  .container { max-width: 1100px; margin: 0 auto; padding: 40px 32px; }\n  .header { border-bottom: 3px solid #1A3A5C; padding-bottom: 20px; margin-bottom: 30px; }\n  .header h1 { font-size: 28px; color: #1A3A5C; margin-bottom: 4px; }\n  .header .meta { font-size: 14px; color: #6c757d; }\n  .score-card { display: flex; border-radius: 8px; overflow: hidden; margin-bottom: 30px; }\n  .score-badge { padding: 24px 32px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 110px; }\n  .score-badge .grade { font-size: 48px; font-weight: 800; color: #fff; line-height: 1; }\n  .score-badge .label { font-size: 11px; color: rgba(255,255,255,0.85); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }\n  .score-body { background: #E8F4FD; padding: 20px 24px; flex: 1; }\n  .score-body h3 { font-size: 16px; color: #1A3A5C; margin-bottom: 6px; }\n  .score-body p { font-size: 14px; color: #495057; }\n  .stat-grid { display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; }\n  .stat-card { flex: 1; min-width: 110px; padding: 16px; border-radius: 6px; text-align: center; }\n  .stat-card .val { font-size: 32px; font-weight: 800; }\n  .stat-card .lbl { font-size: 11px; color: #6c757d; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.05em; }\n  .breakdown { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }\n  .breakdown-item { flex: 1; min-width: 100px; padding: 12px 16px; border-radius: 6px; display: flex; align-items: center; gap: 10px; }\n  .breakdown-item .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }\n  .breakdown-item .count { font-size: 22px; font-weight: 700; }\n  .breakdown-item .name { font-size: 11px; color: #6c757d; }\n  h2 { font-size: 20px; color: #1A3A5C; margin: 30px 0 16px; padding-bottom: 8px; border-bottom: 2px solid #E8F4FD; }\n  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 20px; }\n  thead { background: #1A3A5C; color: #fff; }\n  thead th { padding: 10px 14px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }\n  tbody tr { border-bottom: 1px solid #f3f4f6; }\n  tbody tr:hover { background: #fafafa; }\n  tbody td { padding: 12px 14px; vertical-align: middle; }\n  .empty-state { text-align: center; padding: 60px; color: #6b7280; }\n  .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #DEE2E6; font-size: 12px; color: #adb5bd; font-style: italic; }\n</style>\n</head>\n<body>\n<div class=\"container\">\n\n  <div class=\"header\">\n    <h1>📊 Engagement Health Report</h1>\n    <div class=\"meta\">\n      HubSpot Portal 243444428 &nbsp;|&nbsp;\n      ${reportDate} at ${reportTime} &nbsp;|&nbsp;\n      ${totalContacts} contacts analyzed\n    </div>\n  </div>\n\n  <div class=\"score-card\">\n    <div class=\"score-badge\" style=\"background:${gradeColor}\">\n      <div class=\"grade\">${health.grade}</div>\n      <div class=\"label\">${health.label}</div>\n    </div>\n    <div class=\"score-body\">\n      <h3>Engagement Health Overview</h3>\n      <p>\n        ${totalContacts} contacts analyzed. Average engagement score: <strong>${avgScore}/100</strong>.\n        ${totalFlagged === 0\n          ? 'All contacts show healthy engagement patterns.'\n          : `${totalFlagged} contact${totalFlagged === 1 ? '' : 's'} (${pctFlagged}%) flagged for review. At Risk and Cold contacts should be prioritized for re-engagement before they go Dormant.`\n        }\n      </p>\n    </div>\n  </div>\n\n  <div class=\"stat-grid\">\n    <div class=\"stat-card\" style=\"background:#f3f4f6\">\n      <div class=\"val\" style=\"color:#1A3A5C\">${totalContacts}</div>\n      <div class=\"lbl\">Total Analyzed</div>\n    </div>\n    <div class=\"stat-card\" style=\"background:#f3f4f6\">\n      <div class=\"val\" style=\"color:${scoreColor(avgScore)}\">${avgScore}</div>\n      <div class=\"lbl\">Avg Score</div>\n    </div>\n    <div class=\"stat-card\" style=\"background:#fee2e2\">\n      <div class=\"val\" style=\"color:#E74C3C\">${totalFlagged}</div>\n      <div class=\"lbl\">Flagged</div>\n    </div>\n    <div class=\"stat-card\" style=\"background:#f3f4f6\">\n      <div class=\"val\" style=\"color:#495057\">${pctFlagged}%</div>\n      <div class=\"lbl\">Flagged Rate</div>\n    </div>\n  </div>\n\n  <h2>Status Breakdown</h2>\n  <div class=\"breakdown\">\n    ${ ['Active','At Risk','Cold','Dormant','Opted Out'].map(status =>\n      (statusCounts[status] || 0) > 0 ? `\n      <div class=\"breakdown-item\" style=\"background:${statusBg(status)}\">\n        <div class=\"dot\" style=\"background:${statusColor(status)}\"></div>\n        <div>\n          <div class=\"count\" style=\"color:${statusColor(status)}\">${statusCounts[status] || 0}</div>\n          <div class=\"name\">${status}</div>\n        </div>\n      </div>` : ''\n    ).join('') }\n  </div>\n\n  ${ flaggedContacts.length === 0 ? `\n  <div class=\"empty-state\" style=\"margin-top:30px\">\n    <div style=\"font-size:48px;margin-bottom:16px\">✅</div>\n    <div style=\"font-size:18px;font-weight:600;color:#374151\">No flagged contacts</div>\n    <div style=\"margin-top:8px\">All contacts show Active engagement status.</div>\n  </div>\n  ` : `\n  <h2>Flagged Contacts\n    <span style=\"font-size:14px;font-weight:400;color:#6c757d;margin-left:8px\">— sorted by score (lowest first)</span>\n  </h2>\n  <table>\n    <thead>\n      <tr>\n        <th>Contact</th>\n        <th>Status</th>\n        <th style=\"text-align:center\">Engagement Score</th>\n        <th style=\"text-align:center\">Last Engagement</th>\n        <th>Seniority</th>\n        <th>Data Confidence</th>\n      </tr>\n    </thead>\n    <tbody>${tableRows}</tbody>\n  </table>\n  `}\n\n  <div class=\"footer\">\n    Engagement Intelligence Engine v1.1 &nbsp;|&nbsp;\n    Generated via /engagement-check &nbsp;|&nbsp;\n    <a href=\"https://app-na2.hubspot.com/contacts/243444428\" style=\"color:#adb5bd\">Open HubSpot</a>\n  </div>\n\n</div>\n</body>\n</html>`;\n\n// ---- Slack summary message ----\nconst statusLine = Object.entries(statusCounts)\n  .filter(([, count]) => count > 0)\n  .map(([status, count]) => `${count} ${status}`)\n  .join(' · ');\n\nconst slackSummary = totalFlagged === 0\n  ? `✅ *Engagement Health — All Clear*\\nAll ${totalContacts} contacts show Active engagement. Avg score: *${avgScore}/100*.`\n  : `📊 *Engagement Health Report — Grade: ${health.grade} (${health.label})*\\n${totalContacts} contacts analyzed · Avg score: *${avgScore}/100*\\n\\n${statusLine}\\n\\n${totalFlagged} contact${totalFlagged === 1 ? '' : 's'} flagged. Full report attached.`;\n\nconst buffer = Buffer.from(html, 'utf-8');\nconst dateStr = new Date().toISOString().slice(0, 10);\nconst filename = `engagement-report-${dateStr}.html`;\n\nreturn [{\n  json: {\n    slackSummary,\n    totalContacts,\n    totalFlagged,\n    avgScore,\n    healthGrade:    health.grade,\n    reportFilename: filename,\n    reportSize:     buffer.length\n  },\n  binary: {\n    report: await this.helpers.prepareBinaryData(buffer, filename, 'text/html')\n  }\n}];"
+      },
+      "id": "eng-build-report",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/files.getUploadURLExternal",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "filename", "value": "={{ $json.reportFilename }}" },
+            { "name": "length",   "value": "={{ $json.reportSize }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "eng-get-upload-url",
+      "name": "Get Upload URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [940, 160],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "G1iijhpVLYz6cMOO",
+          "name": "Slack Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0AEH1BS9DH",
+          "mode": "list",
+          "cachedResultName": "marketing"
+        },
+        "text": "={{ $('Build Report').first().json.slackSummary }}",
+        "otherOptions": {}
+      },
+      "id": "eng-slack-summary",
+      "name": "Slack: Send Summary",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [940, 440],
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "9fcibPIkOzi3MegG",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const uploadData = $input.first().json;\nconst binaryData = $('Build Report').first().binary;\nreturn [{\n  json: { upload_url: uploadData.upload_url, file_id: uploadData.file_id },\n  binary: binaryData\n}];"
+      },
+      "id": "eng-prepare-upload",
+      "name": "Prepare Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.upload_url }}",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "report"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "eng-upload-file",
+      "name": "Upload File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [1380, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/files.completeUploadExternal",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"files\": [{\"id\": \"{{ $('Get Upload URL').first().json.file_id }}\"}],\n  \"channel_id\": \"C0AEH1BS9DH\",\n  \"initial_comment\": \"📊 Full engagement report attached — download and open in browser to view\"\n}",
+        "options": {}
+      },
+      "id": "eng-complete-upload",
+      "name": "Complete Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [1600, 160],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "G1iijhpVLYz6cMOO",
+          "name": "Slack Key"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "eng-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-200, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\nconsole.error('[ENGAGEMENT CHECK ERROR]', JSON.stringify({\n  workflow: 'Engagement Intelligence v1.1',\n  error: error.message || 'Unknown error',\n  node: error.node?.name || 'Unknown',\n  timestamp: new Date().toISOString()\n}));\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "eng-log-error",
+      "name": "Log Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [40, 500]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: Receive Command": {
+      "main": [[{ "node": "Ack: Running Check", "type": "main", "index": 0 }]]
+    },
+    "Ack: Running Check": {
+      "main": [[{ "node": "Search: Contact Engagement Data", "type": "main", "index": 0 }]]
+    },
+    "Search: Contact Engagement Data": {
+      "main": [[{ "node": "Read Engagement Scores", "type": "main", "index": 0 }]]
+    },
+    "Read Engagement Scores": {
+      "main": [[{ "node": "Build Report", "type": "main", "index": 0 }]]
+    },
+    "Build Report": {
+      "main": [[
+        { "node": "Get Upload URL",     "type": "main", "index": 0 },
+        { "node": "Slack: Send Summary","type": "main", "index": 0 }
+      ]]
+    },
+    "Get Upload URL": {
+      "main": [[{ "node": "Prepare Upload",   "type": "main", "index": 0 }]]
+    },
+    "Prepare Upload": {
+      "main": [[{ "node": "Upload File",      "type": "main", "index": 0 }]]
+    },
+    "Upload File": {
+      "main": [[{ "node": "Complete Upload",  "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Log Error",        "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "" },
+  "id": "",
+  "tags": []
+}

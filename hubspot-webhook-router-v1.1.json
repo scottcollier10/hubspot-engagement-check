@@ -1,0 +1,102 @@
+{
+  "name": "HubSpot Webhook Router v1.1",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "### 🔀 HUBSPOT WEBHOOK ROUTER v1.1\n\n**Current routes:**\n  Normalization properties    → Normalization Engine\n  canon_engagement_status    → Re-engagement Alert\n  Everything else            → Logged and dropped\n\n**Why canon_engagement_status instead of hs_email_last_open_date:**\nHubSpot Starter doesn't expose native email engagement\nproperties as webhook triggers. canon_engagement_status\nis our own field — fully subscribable.\n\nWhen a Cold/Dormant contact opens an email, HubSpot\nresets their sends counter. Nightly scorer recalculates\nand writes canon_engagement_status: Cold → Active.\nThat change fires this webhook and triggers the alert.\n\n**Tradeoff vs higher tiers:**\nAlerts fire after the 2am scorer run rather than\ninstantly. On Marketing Hub Pro/Enterprise, HubSpot\nexposes hs_email_last_open_date as a webhook trigger\nfor real-time alerts. Great upgrade conversation.\n\n**To add a new route in future:**\n1. Add property name to the ROUTES map in Classify Events\n2. Add forward block in Route Events\n3. No HubSpot changes needed\n\n**Setup:**\n1. Activate this workflow\n2. Paste router webhook URL as HubSpot Target URL\n3. Update NORMALIZATION_WEBHOOK_URL and\n   REENGAGEMENT_WEBHOOK_URL in Route Events node\n4. Add canon_engagement_status subscription in HubSpot:\n   Contact → Property changed → canon_engagement_status",
+        "height": 520,
+        "width": 520,
+        "color": 5
+      },
+      "id": "router-note",
+      "name": "Router Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -360]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-router",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      },
+      "id": "router-webhook",
+      "name": "Webhook: HubSpot Events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 300],
+      "webhookId": "hubspot-router-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "router-ack",
+      "name": "Ack: HubSpot",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [40, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CLASSIFY HUBSPOT EVENTS BY DESTINATION\n// ============================================================\n// Each event has a propertyName. We check it against\n// known route maps and tag it with a destination.\n//\n// Note on canon_engagement_status routing:\n// HubSpot Starter doesn't support hs_email_last_open_date\n// as a webhook trigger. Instead we subscribe to our own\n// canon_engagement_status field. The re-engagement alert\n// checks previousPropertyValue to confirm the contact\n// was Cold or Dormant before the status improved.\n// ============================================================\n\n// ---- Properties routed to the Normalization Engine ----\nconst NORMALIZATION_PROPERTIES = new Set([\n  'jobtitle',\n  'job_function',\n  'seniority',\n  'industry',\n  'company',\n  'annualrevenue',\n  'numberofemployees',\n  'num_employees',\n  // Company properties\n  'name',\n  'type',\n  'hs_annual_revenue'\n]);\n\n// ---- Properties routed to the Re-engagement Alert ----\nconst REENGAGEMENT_PROPERTIES = new Set([\n  'canon_engagement_status'\n]);\n\n// ---- Parse payload ----\nconst body   = $input.first().json;\nconst events = Array.isArray(body) ? body : [body];\n\nif (events.length === 0) {\n  console.log('[ROUTER] Empty payload received.');\n  return [];\n}\n\n// ---- Classify each event ----\nconst classified = events.map(event => {\n  const propertyName = event.propertyName || '';\n  const eventType    = event.eventType    || '';\n  const objectType   = eventType.includes('contact') ? 'contact' :\n                       eventType.includes('company') ? 'company' : 'unknown';\n\n  let destination = 'DROP';\n  if (NORMALIZATION_PROPERTIES.has(propertyName)) destination = 'NORMALIZATION';\n  else if (REENGAGEMENT_PROPERTIES.has(propertyName)) destination = 'REENGAGEMENT';\n\n  console.log(`[ROUTER] ${propertyName} (${objectType}) → ${destination}`);\n  return { destination, objectType, propertyName, originalEvent: event };\n});\n\n// ---- Group by destination ----\nconst grouped = classified.reduce((acc, item) => {\n  if (!acc[item.destination]) acc[item.destination] = [];\n  acc[item.destination].push(item.originalEvent);\n  return acc;\n}, {});\n\nconsole.log('[ROUTER] Summary:', JSON.stringify(\n  Object.fromEntries(Object.entries(grouped).map(([k, v]) => [k, v.length]))\n));\n\nreturn [{\n  json: {\n    normalizationEvents: grouped['NORMALIZATION'] || [],\n    reengagementEvents:  grouped['REENGAGEMENT']  || [],\n    droppedEvents:       grouped['DROP']           || []\n  }\n}];"
+      },
+      "id": "router-classify",
+      "name": "Classify Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// ROUTE EVENTS TO TARGET WORKFLOWS\n// ============================================================\n// ⚠️ UPDATE THESE TWO URLS before activating:\n//\n//   NORMALIZATION_WEBHOOK_URL\n//     Copy from Webhook node in Normalization Engine workflow\n//\n//   REENGAGEMENT_WEBHOOK_URL\n//     Copy from Webhook node in Re-engagement Alert workflow\n// ============================================================\n\nconst NORMALIZATION_WEBHOOK_URL = 'PASTE_NORMALIZATION_WEBHOOK_URL_HERE';\nconst REENGAGEMENT_WEBHOOK_URL  = 'PASTE_REENGAGEMENT_WEBHOOK_URL_HERE';\n\nconst { normalizationEvents, reengagementEvents, droppedEvents } = $input.first().json;\n\nconst results = [];\n\n// ---- Forward to Normalization Engine ----\nif (normalizationEvents.length > 0) {\n  try {\n    if (NORMALIZATION_WEBHOOK_URL === 'PASTE_NORMALIZATION_WEBHOOK_URL_HERE') {\n      throw new Error('NORMALIZATION_WEBHOOK_URL not configured.');\n    }\n    const response = await fetch(NORMALIZATION_WEBHOOK_URL, {\n      method:  'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body:    JSON.stringify(normalizationEvents)\n    });\n    console.log(`[ROUTER] → Normalization: ${normalizationEvents.length} event(s), HTTP ${response.status}`);\n    results.push({ destination: 'NORMALIZATION', events: normalizationEvents.length, status: response.status });\n  } catch (err) {\n    console.error(`[ROUTER] ✗ Normalization forward failed: ${err.message}`);\n    results.push({ destination: 'NORMALIZATION', error: err.message });\n  }\n}\n\n// ---- Forward to Re-engagement Alert ----\nif (reengagementEvents.length > 0) {\n  try {\n    if (REENGAGEMENT_WEBHOOK_URL === 'PASTE_REENGAGEMENT_WEBHOOK_URL_HERE') {\n      throw new Error('REENGAGEMENT_WEBHOOK_URL not configured.');\n    }\n    const response = await fetch(REENGAGEMENT_WEBHOOK_URL, {\n      method:  'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body:    JSON.stringify(reengagementEvents)\n    });\n    console.log(`[ROUTER] → Re-engagement: ${reengagementEvents.length} event(s), HTTP ${response.status}`);\n    results.push({ destination: 'REENGAGEMENT', events: reengagementEvents.length, status: response.status });\n  } catch (err) {\n    console.error(`[ROUTER] ✗ Re-engagement forward failed: ${err.message}`);\n    results.push({ destination: 'REENGAGEMENT', error: err.message });\n  }\n}\n\n// ---- Log dropped events ----\nif (droppedEvents.length > 0) {\n  const props = droppedEvents.map(e => e.propertyName || 'unknown').join(', ');\n  console.log(`[ROUTER] Dropped ${droppedEvents.length} unrouted event(s): ${props}`);\n  results.push({ destination: 'DROP', events: droppedEvents.length });\n}\n\nreturn [{ json: { routed: results, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "router-dispatch",
+      "name": "Route Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {},
+      "id": "router-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-200, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\nconsole.error('[ROUTER ERROR]', JSON.stringify({\n  workflow:  'HubSpot Webhook Router v1.1',\n  error:     error.message || 'Unknown error',\n  node:      error.node?.name || 'Unknown',\n  timestamp: new Date().toISOString()\n}));\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "router-log-error",
+      "name": "Log Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [40, 500]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: HubSpot Events": {
+      "main": [[{ "node": "Ack: HubSpot",    "type": "main", "index": 0 }]]
+    },
+    "Ack: HubSpot": {
+      "main": [[{ "node": "Classify Events", "type": "main", "index": 0 }]]
+    },
+    "Classify Events": {
+      "main": [[{ "node": "Route Events",    "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Log Error",       "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "" },
+  "id": "",
+  "tags": []
+}

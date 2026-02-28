@@ -1,0 +1,142 @@
+{
+  "name": "DEMO SEED — Engagement Data Reset v1.1",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "### 🎬 DEMO SEED SCRIPT v1.1 — Engagement Data Reset\n\n**Fix from v1.0:**\nHubSpot native email fields (hs_email_open,\nhs_email_click, hs_email_sends_since_last_engagement)\nare READ ONLY — HubSpot calculates these internally.\n\nThis version writes directly to your own canonical\nfields instead — fully writable, same end result.\n\n**Fields written:**\n• canon_engagement_score     (0-100)\n• canon_engagement_status   (Active/At Risk/Cold/Dormant)\n• canon_days_since_engagement\n• canon_engagement_last_calculated\n\n**Post-import wiring check (n8n import quirk):**\n⚠ Verify SplitInBatches connections after import:\n  loop output  → Update Contact\n  done output  → Seed Complete\n\n**How to use:**\n1. Execute this workflow (Manual Trigger)\n2. Wait ~15 seconds for all 20 contacts\n3. Run /engagement-check in Slack",
+        "height": 400,
+        "width": 440,
+        "color": 6
+      },
+      "id": "seed-note",
+      "name": "Seed Script Info",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -240]
+    },
+    {
+      "parameters": {},
+      "id": "seed-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"filterGroups\": [\n    {\n      \"filters\": [\n        {\n          \"propertyName\": \"email\",\n          \"operator\": \"HAS_PROPERTY\"\n        }\n      ]\n    }\n  ],\n  \"properties\": [\"firstname\", \"lastname\", \"email\"],\n  \"limit\": 20\n}",
+        "options": {}
+      },
+      "id": "seed-fetch-contacts",
+      "name": "Fetch Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [40, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// DEMO SEED v1.1: Write directly to canonical fields\n// ============================================================\n// HubSpot native email fields (hs_email_open, hs_email_click,\n// hs_email_sends_since_last_engagement) are READ ONLY.\n// This seed writes to our own canon_ fields instead.\n//\n// The engagement-check report reads from canon_ fields,\n// so the demo story is identical.\n//\n// Distribution across 20 contacts:\n//   Active   (score 75-95):  6 contacts\n//   At Risk  (score 45-60):  5 contacts\n//   Cold     (score 25-40):  5 contacts\n//   Dormant  (score 5-20):   4 contacts\n// ============================================================\n\nconst response = $input.first().json;\nconst contacts = response.results || [];\n\nif (contacts.length === 0) {\n  throw new Error('No contacts found. Check HubSpot connection.');\n}\n\nconst now = new Date().toISOString();\n\n// ---- Seed profiles — written to canon_ fields ----\nconst seedProfiles = [\n  // Active — healthy engagement\n  { status: 'Active',  score: 95, daysSince: 2  },\n  { status: 'Active',  score: 88, daysSince: 5  },\n  { status: 'Active',  score: 82, daysSince: 8  },\n  { status: 'Active',  score: 91, daysSince: 1  },\n  { status: 'Active',  score: 76, daysSince: 12 },\n  { status: 'Active',  score: 85, daysSince: 4  },\n\n  // At Risk — starting to go quiet\n  { status: 'At Risk', score: 58, daysSince: 28  },\n  { status: 'At Risk', score: 52, daysSince: 35  },\n  { status: 'At Risk', score: 61, daysSince: 22  },\n  { status: 'At Risk', score: 47, daysSince: 42  },\n  { status: 'At Risk', score: 55, daysSince: 30  },\n\n  // Cold — clear non-engagement pattern\n  { status: 'Cold',    score: 38, daysSince: 65  },\n  { status: 'Cold',    score: 29, daysSince: 80  },\n  { status: 'Cold',    score: 33, daysSince: 72  },\n  { status: 'Cold',    score: 25, daysSince: 90  },\n  { status: 'Cold',    score: 41, daysSince: 58  },\n\n  // Dormant — essentially unresponsive\n  { status: 'Dormant', score: 18, daysSince: 145 },\n  { status: 'Dormant', score: 8,  daysSince: 210 },\n  { status: 'Dormant', score: 12, daysSince: 180 },\n  { status: 'Dormant', score: 5,  daysSince: 290 }\n];\n\n// ---- Map each contact to a seed profile ----\nconst updates = contacts.map((contact, index) => {\n  const profile = seedProfiles[index % seedProfiles.length];\n  const name = [contact.properties?.firstname, contact.properties?.lastname]\n    .filter(Boolean).join(' ') || contact.properties?.email || `Contact ${contact.id}`;\n\n  return {\n    contactId:   contact.id,\n    contactName: name,\n    profile,\n    // These are all writable canonical fields we own\n    properties: {\n      canon_engagement_score:            String(profile.score),\n      canon_engagement_status:           profile.status,\n      canon_days_since_engagement:       String(profile.daysSince),\n      canon_engagement_last_calculated:  now\n    }\n  };\n});\n\n// Log distribution for verification\nconst dist = updates.reduce((acc, u) => {\n  acc[u.profile.status] = (acc[u.profile.status] || 0) + 1;\n  return acc;\n}, {});\nconsole.log(`[SEED v1.1] Seeding ${updates.length} contacts:`, JSON.stringify(dist));\n\nreturn updates.map(u => ({ json: u }));"
+      },
+      "id": "seed-assign-profiles",
+      "name": "Assign Seed Profiles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "seed-split",
+      "name": "Process Each Contact",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{ $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.properties }) }}",
+        "options": {}
+      },
+      "id": "seed-update-contact",
+      "name": "Update Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 180],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Grab the contact name/profile from Assign Seed Profiles\n// (current item in the loop)\nconst allItems = $('Assign Seed Profiles').all();\nconst loopIndex = $('Process Each Contact').context.currentRunIndex;\nconst current = allItems[loopIndex]?.json;\n\nif (current) {\n  console.log(`[SEED] ✓ ${current.contactName} → ${current.profile.status} (score: ${current.profile.score}, days: ${current.profile.daysSince})`);\n}\n\nreturn [{ json: { seeded: true, contactId: current?.contactId } }];"
+      },
+      "id": "seed-log",
+      "name": "Log Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('[SEED] ✅ All contacts seeded. Run /engagement-check in Slack.');\nreturn [{\n  json: {\n    status:    'complete',\n    message:   'Demo data seeded successfully. Run /engagement-check in Slack.',\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "seed-complete",
+      "name": "Seed Complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 420]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Fetch Contacts", "type": "main", "index": 0 }]]
+    },
+    "Fetch Contacts": {
+      "main": [[{ "node": "Assign Seed Profiles", "type": "main", "index": 0 }]]
+    },
+    "Assign Seed Profiles": {
+      "main": [[{ "node": "Process Each Contact", "type": "main", "index": 0 }]]
+    },
+    "Process Each Contact": {
+      "main": [
+        [{ "node": "Update Contact", "type": "main", "index": 0 }],
+        [{ "node": "Seed Complete",  "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Contact": {
+      "main": [[{ "node": "Log Update", "type": "main", "index": 0 }]]
+    },
+    "Log Update": {
+      "main": [[{ "node": "Process Each Contact", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "" },
+  "id": "",
+  "tags": []
+}

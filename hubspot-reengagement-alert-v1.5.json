@@ -1,0 +1,164 @@
+{
+  "name": "HubSpot Engagement Intelligence — Re-engagement Alert v1.5",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "### 🔔 RE-ENGAGEMENT ALERT v1.5\n\n**What v1.5 fixes:**\n\n1. BODY EXTRACTION: HubSpot sends payload as\n   { headers, params, query, body: [...] }\n   We now correctly read body[0], not the wrapper.\n\n2. MISSING previousPropertyValue: HubSpot Starter\n   never sends this field. We now alert on ANY\n   transition to Active — accept minor false positives\n   rather than missing every real re-engagement.\n\n3. REMOVED Merge node: Linear chain means\n   $('Parse & Filter Event').first() works fine\n   in Build Alert. No merge needed.\n\n**Flow:**\nWebhook → Ack (200) [immediate]\n        → Parse & Filter → Fetch Contact\n                        → Build Alert → Slack\n\n**Fires when:**\n  * → Active  ✅  (always alert — can't verify prior)\n  Cold → anything better  ✅  (if previousValue present)\n  Dormant → anything better  ✅  (if previousValue present)\n  Anything → worse status  ❌  exits silently",
+        "height": 400,
+        "width": 480,
+        "color": 3
+      },
+      "id": "reeng-note",
+      "name": "Workflow Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -320]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reengagement-alert",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "reeng-webhook",
+      "name": "Webhook: Receive Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 300],
+      "webhookId": "reengagement-alert-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "reeng-ack",
+      "name": "Ack: Router",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [-200, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PARSE & FILTER EVENT — v1.5\n// ============================================================\n// DATA SHAPE AT THIS POINT:\n// n8n webhook v2 wraps the raw POST body like this:\n//   $input.first().json = {\n//     headers: { ... },\n//     params:  {},\n//     query:   {},\n//     body:    [ { eventId, objectId, propertyValue, ... } ]\n//   }\n// The actual HubSpot event is at .body[0]\n//\n// IMPORTANT — HubSpot Starter tier:\n// previousPropertyValue is NOT sent by HubSpot Starter.\n// Strategy: alert on any transition TO 'Active'.\n// If previousPropertyValue IS present, also check it was\n// Cold or Dormant (avoids alerting on brand-new contacts).\n// ============================================================\n\nconst SEVERITY = {\n  'Active':    1,\n  'At Risk':   2,\n  'Cold':      3,\n  'Dormant':   4,\n  'Opted Out': 5\n};\n\nfunction isImprovement(fromStatus, toStatus) {\n  return (SEVERITY[toStatus] || 0) < (SEVERITY[fromStatus] || 0);\n}\n\n// Step 1: Extract the body — handle both wrapped and unwrapped payloads\nconst rawJson = $input.first().json;\n\n// Router forwards the HubSpot event array directly as the POST body.\n// n8n webhook v2 puts it under .body — but check both just in case.\nlet eventArray;\nif (Array.isArray(rawJson.body)) {\n  eventArray = rawJson.body;\n} else if (Array.isArray(rawJson)) {\n  eventArray = rawJson;\n} else {\n  // Single event object (some router configs send unwrapped)\n  eventArray = [rawJson];\n}\n\nif (eventArray.length === 0) {\n  console.log('[RE-ENGAGEMENT] Empty payload. Exiting.');\n  return [];\n}\n\nconst event = eventArray[0];\nconsole.log('[RE-ENGAGEMENT] Raw event:', JSON.stringify(event));\n\nconst contactId      = String(event.objectId || '');\nconst newStatus      = event.propertyValue         || '';\nconst previousStatus = event.previousPropertyValue || '';\nconst occurredAt     = event.occurredAt\n  ? new Date(event.occurredAt).toISOString()\n  : new Date().toISOString();\n\nif (!contactId || contactId === 'undefined') {\n  console.log('[RE-ENGAGEMENT] No valid contactId. Exiting.');\n  return [];\n}\n\nif (!newStatus) {\n  console.log('[RE-ENGAGEMENT] No newStatus. Exiting.');\n  return [];\n}\n\n// --- Filtering logic ---\n\n// Case 1: previousStatus is available (HubSpot Pro+ or manual test)\nif (previousStatus) {\n  const ALERT_FROM = new Set(['Cold', 'Dormant']);\n  if (!ALERT_FROM.has(previousStatus)) {\n    console.log(`[RE-ENGAGEMENT] Previous '${previousStatus}' not Cold/Dormant. Exiting.`);\n    return [];\n  }\n  if (!isImprovement(previousStatus, newStatus)) {\n    console.log(`[RE-ENGAGEMENT] ${previousStatus} → ${newStatus} is not improvement. Exiting.`);\n    return [];\n  }\n  console.log(`[RE-ENGAGEMENT] ⚡ Re-engagement (verified): ${contactId} ${previousStatus} → ${newStatus}`);\n}\n// Case 2: no previousStatus (HubSpot Starter) — alert only on Active\nelse {\n  if (newStatus !== 'Active') {\n    console.log(`[RE-ENGAGEMENT] No previous status + newStatus is '${newStatus}' (not Active). Exiting.`);\n    return [];\n  }\n  console.log(`[RE-ENGAGEMENT] ⚡ Re-engagement (assumed): ${contactId} → ${newStatus} (no prior status available)`);\n}\n\nreturn [{\n  json: {\n    contactId,\n    newStatus,\n    previousStatus: previousStatus || 'Unknown',\n    occurredAt\n  }\n}];"
+      },
+      "id": "reeng-parse",
+      "name": "Parse & Filter Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{ $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "properties",
+              "value": "firstname,lastname,email,jobtitle,company,lifecyclestage,canon_engagement_score,canon_days_since_engagement,canon_seniority,canon_persona,canon_industry_tier"
+            }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "reeng-fetch-contact",
+      "name": "Fetch Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// BUILD ALERT — v1.5\n// ============================================================\n// DATA SHAPE AT THIS POINT:\n//\n// $input.first().json = HubSpot contact response:\n//   {\n//     id: \"208058893002\",\n//     properties: {\n//       firstname, lastname, email, jobtitle, company,\n//       canon_engagement_score, canon_days_since_engagement,\n//       canon_seniority, canon_persona, canon_industry_tier\n//     }\n//   }\n//\n// $('Parse & Filter Event').first().json = our parsed event:\n//   { contactId, newStatus, previousStatus, occurredAt }\n//\n// Cross-reference works here because this is a LINEAR chain:\n// Parse & Filter → Fetch Contact → Build Alert\n// n8n resolves $() references correctly in linear flows.\n// ============================================================\n\nconst contact   = $input.first().json;\nconst eventData = $('Parse & Filter Event').first().json;\n\n// Log what we received so we can debug if anything is still undefined\nconsole.log('[BUILD ALERT] contact.id:', contact.id);\nconsole.log('[BUILD ALERT] eventData:', JSON.stringify(eventData));\n\nconst p = contact.properties || {};\n\nconst { contactId, previousStatus, newStatus, occurredAt } = eventData;\n\n// Contact fields with safe fallbacks\nconst name         = [p.firstname, p.lastname].filter(Boolean).join(' ') || '(No name)';\nconst email        = p.email    || '—';\nconst jobTitle     = p.jobtitle || '—';\nconst company      = p.company  || '—';\nconst score        = parseInt(p.canon_engagement_score       || '0', 10);\nconst daysSince    = parseInt(p.canon_days_since_engagement  || '0', 10);\nconst seniority    = p.canon_seniority     || '—';\nconst persona      = p.canon_persona       || '—';\nconst industryTier = p.canon_industry_tier || '—';\n\n// Format silence duration\nfunction formatSilence(days) {\n  if (!days || days === 0) return 'recently';\n  if (days < 30)  return `${days} days`;\n  if (days < 365) return `${Math.floor(days / 30)} month${Math.floor(days / 30) === 1 ? '' : 's'}`;\n  return `${Math.floor(days / 365)} year${Math.floor(days / 365) === 1 ? '' : 's'}`;\n}\n\n// Readable timestamp\nconst detectedAt = occurredAt\n  ? new Date(occurredAt).toLocaleString('en-US', {\n      month: 'short', day: 'numeric',\n      hour: '2-digit', minute: '2-digit', timeZoneName: 'short'\n    })\n  : 'overnight';\n\n// Alert config keyed by transition type\nconst ALERT_CONFIG = {\n  'Dormant→Active':  { emoji: '🔥', urgency: 'High signal — went fully dark and just came back. Act quickly.' },\n  'Dormant→At Risk': { emoji: '👀', urgency: 'Partial recovery from Dormant. Worth a light touch.' },\n  'Dormant→Cold':    { emoji: '🧊', urgency: 'Still Cold but trending up from Dormant. Monitor closely.' },\n  'Cold→Active':     { emoji: '⚡', urgency: 'Cold contact fully re-engaged. Good time to follow up.' },\n  'Cold→At Risk':    { emoji: '📈', urgency: 'Moving in the right direction from Cold.' },\n  'Unknown→Active':  { emoji: '🔔', urgency: 'Contact became Active. Previous status unavailable (HubSpot Starter).' }\n};\n\nconst configKey = `${previousStatus}→${newStatus}`;\nconst config    = ALERT_CONFIG[configKey] || { emoji: '🔔', urgency: '' };\n\nconst hubspotUrl = `https://app-na2.hubspot.com/contacts/243444428/record/0-1/${contact.id || contactId}`;\n\n// Build message lines\nconst contextParts = [];\nif (jobTitle !== '—') contextParts.push(jobTitle);\nif (company  !== '—') contextParts.push(company);\nconst contextLine = contextParts.join(' · ') || 'No title or company on record';\n\nconst enrichParts = [];\nif (seniority    !== '—') enrichParts.push(`*${seniority}*`);\nif (persona      !== '—') enrichParts.push(persona);\nif (industryTier !== '—') enrichParts.push(`ICP: ${industryTier}`);\nconst enrichLine = enrichParts.length > 0 ? enrichParts.join('  ·  ') : null;\n\nconst lines = [];\nlines.push(`${config.emoji} *Re-engagement detected: ${previousStatus} → ${newStatus}*`);\nlines.push('');\nlines.push(`*<${hubspotUrl}|${name}>*`);\nlines.push(contextLine);\nif (email !== '—') lines.push(email);\nif (enrichLine) {\n  lines.push('');\n  lines.push(enrichLine);\n}\nlines.push('');\nlines.push(`*Previous score:* ${score}/100  ·  *Was silent for:* ${formatSilence(daysSince)}`);\nlines.push(`*Detected:* ${detectedAt} _(via nightly scorer)_`);\nif (config.urgency) {\n  lines.push('');\n  lines.push(`_${config.urgency}_`);\n}\n\nconsole.log(`[BUILD ALERT] Posting: ${name} (${previousStatus} → ${newStatus})`);\n\nreturn [{ json: { slackMessage: lines.join('\\n'), contactName: name } }];"
+      },
+      "id": "reeng-build-alert",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0AEH1BS9DH",
+          "mode": "list",
+          "cachedResultName": "marketing"
+        },
+        "text": "={{ $json.slackMessage }}",
+        "otherOptions": {}
+      },
+      "id": "reeng-slack",
+      "name": "Slack: Post Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [740, 300],
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "9fcibPIkOzi3MegG",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "reeng-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-200, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\nconsole.error('[RE-ENGAGEMENT ERROR]', JSON.stringify({\n  workflow:  'Re-engagement Alert v1.5',\n  error:     error.message || 'Unknown error',\n  node:      error.node?.name || 'Unknown',\n  timestamp: new Date().toISOString()\n}));\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "reeng-log-error",
+      "name": "Log Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [40, 500]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: Receive Event": {
+      "main": [
+        [
+          { "node": "Ack: Router",          "type": "main", "index": 0 },
+          { "node": "Parse & Filter Event", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Parse & Filter Event": {
+      "main": [[{ "node": "Fetch Contact", "type": "main", "index": 0 }]]
+    },
+    "Fetch Contact": {
+      "main": [[{ "node": "Build Alert",   "type": "main", "index": 0 }]]
+    },
+    "Build Alert": {
+      "main": [[{ "node": "Slack: Post Alert", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Log Error", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "" },
+  "id": "",
+  "tags": []
+}

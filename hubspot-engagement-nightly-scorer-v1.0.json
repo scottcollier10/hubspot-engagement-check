@@ -1,0 +1,213 @@
+{
+  "name": "HubSpot Engagement Intelligence — Nightly Scorer v1.0",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "### ⏰ NIGHTLY ENGAGEMENT SCORER v1.0\n\n**What this does:**\nRuns every night at 2am. Reads real HubSpot email\nengagement data from every contact, calculates an\nengagement score and status, and writes the results\nback to your canonical fields.\n\nAfter this runs, /engagement-check reports on real\ndata — no seed script needed for production.\n\n**Canonical fields written per contact:**\n• canon_engagement_score            (0-100)\n• canon_engagement_status           (Active/At Risk/Cold/Dormant/Opted Out)\n• canon_days_since_engagement       (integer)\n• canon_engagement_last_calculated  (timestamp)\n\n**Scoring uses these READ-ONLY HubSpot fields:**\n• hs_email_sends_since_last_engagement  ← primary decay signal\n• hs_email_open                         ← historical depth bonus\n• hs_email_click                        ← historical depth bonus\n• hs_email_optout                       ← hard penalty\n• hs_email_last_open_date               ← recency signal\n• hs_email_last_click_date              ← recency signal\n\n**Post-import wiring check (n8n import quirk):**\n⚠ Verify SplitInBatches connections after import:\n  loop output → Get Contact Full Data\n  done output → Log Run Complete\n\n**Schedule:** Daily at 2:00am\nAdjust in the Schedule Trigger node if needed.",
+        "height": 460,
+        "width": 500,
+        "color": 4
+      },
+      "id": "scorer-note",
+      "name": "Workflow Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, -280]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "scorer-schedule",
+      "name": "Schedule: 2am Nightly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"filterGroups\": [\n    {\n      \"filters\": [\n        {\n          \"propertyName\": \"email\",\n          \"operator\": \"HAS_PROPERTY\"\n        }\n      ]\n    }\n  ],\n  \"properties\": [\n    \"firstname\",\n    \"lastname\",\n    \"email\",\n    \"hs_email_sends_since_last_engagement\",\n    \"hs_email_open\",\n    \"hs_email_click\",\n    \"hs_email_bounce\",\n    \"hs_email_optout\",\n    \"hs_email_last_open_date\",\n    \"hs_email_last_click_date\",\n    \"hs_email_last_send_date\",\n    \"notes_last_activity_date\"\n  ],\n  \"limit\": 100\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "scorer-fetch-page1",
+      "name": "Fetch Contacts — Page 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [40, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PREPARE CONTACTS FOR SCORING LOOP\n// ============================================================\n// Extracts the contact list from the HubSpot search response\n// and passes each contact as a separate item into\n// SplitInBatches for individual processing.\n//\n// Note on pagination:\n// HubSpot returns up to 100 contacts per request.\n// For portals with >100 contacts, a pagination loop\n// would be needed. For the current scale this is sufficient.\n// The nightly scorer v1.1 can add pagination when needed.\n// ============================================================\n\nconst response = $input.first().json;\nconst contacts = response.results || [];\n\nif (contacts.length === 0) {\n  console.log('[SCORER] No contacts found with email. Exiting.');\n  return [];\n}\n\nconsole.log(`[SCORER] Starting nightly run. Contacts to score: ${contacts.length}`);\nconsole.log(`[SCORER] Run started at: ${new Date().toISOString()}`);\n\n// Pass each contact as its own item into the batch loop\nreturn contacts.map(contact => ({\n  json: {\n    contactId:  contact.id,\n    properties: contact.properties || {}\n  }\n}));"
+      },
+      "id": "scorer-prepare",
+      "name": "Prepare Contact List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "scorer-split",
+      "name": "Process Each Contact",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// CALCULATE ENGAGEMENT SCORE\n// ============================================================\n// Reads HubSpot native fields (read-only — we only READ here)\n// and produces canonical field values to write back.\n//\n// PRIMARY SIGNAL:\n//   hs_email_sends_since_last_engagement\n//   The number of emails sent since the contact last opened\n//   or clicked anything. Increments on each send, resets\n//   to 0 when they engage. Best single decay indicator.\n//\n// SECONDARY SIGNALS:\n//   Historical opens/clicks add a depth bonus — contacts\n//   who engaged a lot historically get partial credit even\n//   if they've gone quiet recently.\n//\n// DECAY THRESHOLDS (configurable):\n//   AT_RISK:  3  sends without engagement\n//   COLD:     5  sends without engagement\n//   DORMANT:  8  sends without engagement\n// ============================================================\n\n// ---- Configurable thresholds — adjust per client ----\nconst THRESHOLDS = {\n  AT_RISK: 3,\n  COLD:    5,\n  DORMANT: 8\n};\n\n// ---- Score weight configuration ----\nconst WEIGHTS = {\n  SENDS_PENALTY_PER:  12,  // deduct per send-since-engagement\n  MAX_SENDS_PENALTY:  80,  // cap total sends penalty\n  OPENS_BONUS_PER:     3,  // add per historical open\n  MAX_OPENS_BONUS:    25,  // cap total opens bonus\n  CLICKS_BONUS_PER:    5,  // add per historical click\n  MAX_CLICKS_BONUS:   25,  // cap total clicks bonus\n  OPTOUT_PENALTY:     50   // hard deduction for opted-out\n};\n\n// ---- Helper: days between a date string and now ----\nfunction daysSince(dateStr) {\n  if (!dateStr) return null;\n  const diffMs = Date.now() - new Date(dateStr).getTime();\n  return Math.max(0, Math.floor(diffMs / 86400000));\n}\n\n// ---- Helper: classify status from sends-since-engagement ----\nfunction classifyStatus(sendsSinceLast, optedOut) {\n  if (optedOut)                              return 'Opted Out';\n  if (sendsSinceLast >= THRESHOLDS.DORMANT)  return 'Dormant';\n  if (sendsSinceLast >= THRESHOLDS.COLD)     return 'Cold';\n  if (sendsSinceLast >= THRESHOLDS.AT_RISK)  return 'At Risk';\n  return 'Active';\n}\n\n// ---- Helper: calculate 0-100 engagement score ----\nfunction calculateScore(sendsSinceLast, opens, clicks, optedOut) {\n  let score = 100;\n\n  // Primary decay: each send without engagement is penalized\n  score -= Math.min(sendsSinceLast * WEIGHTS.SENDS_PENALTY_PER, WEIGHTS.MAX_SENDS_PENALTY);\n\n  // Historical depth: contacts who engaged a lot get partial credit\n  score += Math.min(opens  * WEIGHTS.OPENS_BONUS_PER,  WEIGHTS.MAX_OPENS_BONUS);\n  score += Math.min(clicks * WEIGHTS.CLICKS_BONUS_PER, WEIGHTS.MAX_CLICKS_BONUS);\n\n  // Opted out is a hard negative signal\n  if (optedOut) score -= WEIGHTS.OPTOUT_PENALTY;\n\n  return Math.min(100, Math.max(0, Math.round(score)));\n}\n\n// ---- Process the current contact ----\nconst { contactId, properties: p } = $input.first().json;\n\nconst sendsSinceLast = parseInt(p.hs_email_sends_since_last_engagement || '0', 10);\nconst totalOpens     = parseInt(p.hs_email_open  || '0', 10);\nconst totalClicks    = parseInt(p.hs_email_click || '0', 10);\nconst optedOut       = p.hs_email_optout === 'true';\n\n// Most recent engagement date — prefer click over open\nconst lastEngagementDate = [\n  p.hs_email_last_click_date,\n  p.hs_email_last_open_date\n].filter(Boolean).sort().reverse()[0] || null;\n\nconst daysSinceEngagement = daysSince(lastEngagementDate);\n\nconst engagementScore  = calculateScore(sendsSinceLast, totalOpens, totalClicks, optedOut);\nconst engagementStatus = classifyStatus(sendsSinceLast, optedOut);\n\nconst contactName = [p.firstname, p.lastname].filter(Boolean).join(' ')\n  || p.email\n  || `Contact ${contactId}`;\n\nconsole.log(`[SCORER] ${contactName} → ${engagementStatus} (score: ${engagementScore}, sends: ${sendsSinceLast})`);\n\nreturn [{\n  json: {\n    contactId,\n    contactName,\n    engagementScore,\n    engagementStatus,\n    daysSinceEngagement,\n    // The canonical fields we will write back to HubSpot\n    canonicalFields: {\n      canon_engagement_score:           String(engagementScore),\n      canon_engagement_status:          engagementStatus,\n      canon_days_since_engagement:      String(daysSinceEngagement ?? ''),\n      canon_engagement_last_calculated: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "id": "scorer-calculate",
+      "name": "Calculate Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 180]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{ $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.canonicalFields }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "scorer-write-back",
+      "name": "Write Canonical Fields",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 180],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "u5vY99HABKKS5olQ",
+          "name": "HubSpot Data Normalization Engine Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log result for this contact and pass back to loop\nconst calc = $('Calculate Score').first().json;\nconsole.log(`[SCORER] ✓ Written: ${calc.contactName} → ${calc.engagementStatus} (${calc.engagementScore})`);\nreturn [{ json: { done: true, contactId: calc.contactId } }];"
+      },
+      "id": "scorer-log-contact",
+      "name": "Log Contact Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// RUN COMPLETE SUMMARY\n// ============================================================\n// Pulls all processed items from the loop and assembles\n// a summary of the nightly run for Slack notification.\n// ============================================================\n\n// Count how many items were processed by reading the\n// total from the SplitInBatches context\nconst allCalcItems = $('Calculate Score').all();\n\nconst statusCounts = allCalcItems.reduce((acc, item) => {\n  const status = item.json.engagementStatus || 'Unknown';\n  acc[status] = (acc[status] || 0) + 1;\n  return acc;\n}, {});\n\nconst totalProcessed = allCalcItems.length;\nconst avgScore = totalProcessed > 0\n  ? Math.round(allCalcItems.reduce((sum, i) => sum + (i.json.engagementScore || 0), 0) / totalProcessed)\n  : 0;\n\nconst flaggedCount = allCalcItems.filter(\n  i => !['Active'].includes(i.json.engagementStatus)\n).length;\n\nconsole.log(`[SCORER] ✅ Nightly run complete.`);\nconsole.log(`[SCORER] Total processed: ${totalProcessed}`);\nconsole.log(`[SCORER] Avg score: ${avgScore}`);\nconsole.log(`[SCORER] Flagged: ${flaggedCount}`);\nconsole.log(`[SCORER] Status breakdown:`, JSON.stringify(statusCounts));\n\n// Build Slack summary line\nconst statusLine = Object.entries(statusCounts)\n  .filter(([, count]) => count > 0)\n  .map(([status, count]) => `${count} ${status}`)\n  .join(' · ');\n\nconst slackMessage = flaggedCount === 0\n  ? `✅ *Nightly Engagement Scorer — Complete*\\n${totalProcessed} contacts scored. All Active. Avg score: *${avgScore}/100*.`\n  : `⏰ *Nightly Engagement Scorer — Complete*\\n${totalProcessed} contacts scored · Avg score: *${avgScore}/100*\\n${statusLine}\\n\\n${flaggedCount} contact${flaggedCount === 1 ? '' : 's'} flagged. Run /engagement-check for full details.`;\n\nreturn [{\n  json: {\n    totalProcessed,\n    avgScore,\n    flaggedCount,\n    statusCounts,\n    slackMessage,\n    completedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "scorer-summarize",
+      "name": "Summarize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 440]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0AEH1BS9DH",
+          "mode": "list",
+          "cachedResultName": "marketing"
+        },
+        "text": "={{ $json.slackMessage }}",
+        "otherOptions": {}
+      },
+      "id": "scorer-slack-notify",
+      "name": "Slack: Notify Complete",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [920, 440],
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "9fcibPIkOzi3MegG",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "scorer-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-200, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\nconsole.error('[SCORER ERROR]', JSON.stringify({\n  workflow:  'Nightly Engagement Scorer v1.0',\n  error:     error.message || 'Unknown error',\n  node:      error.node?.name || 'Unknown',\n  timestamp: new Date().toISOString()\n}));\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "scorer-log-error",
+      "name": "Log Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [40, 500]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule: 2am Nightly": {
+      "main": [[{ "node": "Fetch Contacts — Page 1", "type": "main", "index": 0 }]]
+    },
+    "Fetch Contacts — Page 1": {
+      "main": [[{ "node": "Prepare Contact List", "type": "main", "index": 0 }]]
+    },
+    "Prepare Contact List": {
+      "main": [[{ "node": "Process Each Contact", "type": "main", "index": 0 }]]
+    },
+    "Process Each Contact": {
+      "main": [
+        [{ "node": "Calculate Score",    "type": "main", "index": 0 }],
+        [{ "node": "Summarize Run",      "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate Score": {
+      "main": [[{ "node": "Write Canonical Fields", "type": "main", "index": 0 }]]
+    },
+    "Write Canonical Fields": {
+      "main": [[{ "node": "Log Contact Result",     "type": "main", "index": 0 }]]
+    },
+    "Log Contact Result": {
+      "main": [[{ "node": "Process Each Contact",   "type": "main", "index": 0 }]]
+    },
+    "Summarize Run": {
+      "main": [[{ "node": "Slack: Notify Complete", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Log Error",              "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "" },
+  "id": "",
+  "tags": []
+}
